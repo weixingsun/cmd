@@ -83,18 +83,42 @@ fn count_int(name:&str)->u32{
     let val:u32=exec(&cmd).0.parse().unwrap();
     return val;
 }
-fn count_cpu()->usize{
+fn count_numa_cpu()->usize{
     let cmd="lscpu|grep '^CPU(s)'|awk '{{print $NF}}'";
     let val:usize=exec(&cmd).0.parse().unwrap();
-    return val;
+    return val/count_numa_num();
 }
-fn get_pcie_bus_list(gpu:usize)->Vec<String>{
-    let cmd=format!("lspci -d:{gpu}|awk '{{print $1}}'");
-    let bus_list:Vec<String>=exec(&cmd).0.lines().map(|v| v.to_string()).collect();
-    let uniq_list: HashSet<String> = bus_list.into_iter().collect();
-    let mut v: Vec<_> = uniq_list.into_iter().collect();
-    v.sort();
-    return v
+fn count_numa_num()->usize{
+    let cmd="lscpu|grep 'NUMA node(s)'|awk '{{print $NF}}'";
+    let numa_n:usize=exec(&cmd).0.parse().unwrap();
+    return numa_n;
+}
+fn get_pcie_bus_list(numa:i64,gpu:usize)->Vec<String>{
+    if numa<0{
+        let cmd=format!("lspci -d:{gpu}|awk '{{print $1}}'");
+        let bus_list:Vec<String>=exec(&cmd).0.lines().map(|v| v.to_string()).collect();
+        let uniq_list: HashSet<String> = bus_list.into_iter().collect();
+        let mut v: Vec<_> = uniq_list.into_iter().collect();
+        v.sort();
+        return v
+    }else{
+        let cmd=format!("grep {numa} /sys/class/pci_bus/*/device/numa_node|awk -F/ '{{print $5}}'");
+        let bus_list_numa:Vec<String>=exec(&cmd).0.lines().map(|v| v.to_string()).collect();
+        let uniq_list_numa: HashSet<String> = bus_list_numa.into_iter().collect();
+        let mut numa: Vec<String> = uniq_list_numa.into_iter().collect();
+        numa.sort();
+        let numa_len=numa.last().unwrap().len();
+
+        let cmd=format!("lspci -d:{gpu}|awk '{{print $1}}'");
+        let bus_list_all:Vec<String>=exec(&cmd).0.lines()
+          .map(|v| v.to_string())
+          .filter(|i|numa.contains(&i[..numa_len].to_owned()))
+          .collect();
+        let uniq_list_all: HashSet<String> = bus_list_all.into_iter().collect();
+        let mut all: Vec<String> = uniq_list_all.into_iter().collect();
+        all.sort();
+        return all;
+    }
 }
 fn write_int_title(name:&str)->String{
     let title_n=count_title();
@@ -209,6 +233,26 @@ fn set_dyn_int(name:&str,cpu:usize,dym:bool){
         }
     }
 }
+fn set_irq_numa(mode:&str,gpu:usize,numa:i64,statc:bool){
+    let num=mode.split("_").into_iter().last().unwrap().replace("c","");
+    let num:usize=num.parse().unwrap();
+    let bus_list=get_pcie_bus_list(numa,gpu);
+    println!("{:?}",bus_list);
+    let n_pci=bus_list.len();  // 8*4=32
+    let n_cpu=count_numa_cpu();
+    let numa=if numa<0{0}else{numa as usize};
+    for i in 0..n_pci{
+        let pci=&bus_list[i];
+        let cpu_idx=n_cpu*numa+i*num;
+        println!("pci={pci} cpu={cpu_idx}");
+        if mode.contains("set"){
+            set_dyn_int(pci,cpu_idx,statc);
+        }else{
+            let df=get_dyn_int(pci,statc);
+            println!("{:?}",df);
+        }
+    }
+}
 
 fn get_options() -> (bool,bool,String,String,usize,usize) {
     let matches = clap::Command::new("Interrupt Binding Tool")
@@ -216,9 +260,10 @@ fn get_options() -> (bool,bool,String,String,usize,usize) {
         .author("Weixing Sun <weixing.sun@gmail.com>")
         .about("Perf Toolbox")
         .arg(clap::arg!(--debug).required(false).help("debug mode, default: false"))
-        .arg(clap::arg!(--mode <VALUE>).required(true).help("[get/set]_all_32c"))
+        .arg(clap::arg!(--mode <VALUE>).required(true).help("[get/set]_8c"))
         .arg(clap::arg!(--static).required(false).help("scan type, default: dynamic"))
         .arg(clap::arg!(--name <VALUE>).required(false).help("unique name like: 0000:01:00.1"))
+        //.arg(clap::arg!(--numa <VALUE>).required(false).help("bind numa, default: 0"))
         .arg(clap::arg!(--cpu <VALUE>).required(false).help("bind cpu, default: 0"))
         .arg(clap::arg!(--gpu <VALUE>).required(false).help("gpu type, default: 200"))
         .get_matches();
@@ -227,6 +272,8 @@ fn get_options() -> (bool,bool,String,String,usize,usize) {
     let mode = matches.get_one::<String>("mode").unwrap().to_owned();
     let name = matches.get_one::<String>("name");
     let name = if name.is_none() {"0000:01:00.1"} else {name.unwrap()};
+    //let numa = matches.get_one::<String>("numa");
+    //let numa = if numa.is_none() {-1} else {numa.unwrap().parse().unwrap()};
     let cpu = matches.get_one::<String>("cpu");
     let cpu = if cpu.is_none() {0} else {cpu.unwrap().parse().unwrap()};
     let gpu = matches.get_one::<String>("gpu");
@@ -244,24 +291,16 @@ fn main() {
         println!("{:?}",df);
     }else if mode.eq("set"){
         set_dyn_int(&name,cpu,statc);
-    }else if mode.contains("all_32c"){
-        let bus_list=get_pcie_bus_list(gpu);
-        println!("{:?}",bus_list);
-        let n_pci=bus_list.len();  // 8*4=32
-        let n_cpu=count_cpu();     // 256
-        let ngroup=n_cpu/n_pci;    // 256/32=8
-        for i in 0..n_pci{
-            let pci=&bus_list[i];
-            let cpu_idx=i*ngroup;
-            let step=4;
-            let step_idx=step*ngroup*(cpu_idx/(ngroup*step));
-            println!("pci={pci} cpu={step_idx}");
-            if mode.contains("set"){
-                set_dyn_int(pci,step_idx,statc);
-            }else{
-                let df=get_dyn_int(pci,statc);
-                println!("{:?}",df);
+    }else if mode.ends_with("c"){  // set_8c
+        let numa_n=count_numa_num();
+        if numa_n>1{
+            for i in 0..numa_n{
+                set_irq_numa(&mode,gpu,i as i64,statc);
             }
+        }else{
+            set_irq_numa(&mode,gpu,-1,statc);
+
         }
+
     }
 }
