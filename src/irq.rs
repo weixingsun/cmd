@@ -148,7 +148,7 @@ fn write_int_number(name:&str)->String{
     let cmd=format!("grep {name} {INT} >> data.df");
     return exec(&cmd).0;
 }
-fn get_dyn_int(name:&str,statc:bool)->DataFrame{
+fn get_df_int(name:&str,statc:bool)->DataFrame{
     let df1 = get_int_df(name);
     if statc{
         return df1.lazy().select(
@@ -220,7 +220,7 @@ fn get_dyn_int(name:&str,statc:bool)->DataFrame{
     sum_df
 }
 fn set_dyn_int(name:&str,cpu:usize,dym:bool){
-    let df=get_dyn_int(&name,dym);
+    let df=get_df_int(&name,dym);
     println!("{:?}",df);
     let irq_vec: Vec<i64> = df["IRQ"].i64().unwrap().into_no_null_iter().collect();
     println!("set irqs {:?} -> {cpu}",irq_vec);
@@ -231,6 +231,19 @@ fn set_dyn_int(name:&str,cpu:usize,dym:bool){
         if err.len()>0{
             println!("err:{err}");
         }
+    }
+}
+fn set_dyn_int_one(name:&str,cpu:usize,dym:bool,index:usize){
+    let df=get_df_int(&name,dym);
+    println!("{:?}",df);
+    let irq_vec: Vec<i64> = df["IRQ"].i64().unwrap().into_no_null_iter().collect();
+    let irq_num = irq_vec.get(index).unwrap();
+    println!("set one irq {irq_num} -> {cpu}");
+    let file=format!("/proc/irq/{irq_num}/smp_affinity_list");
+    let cmd=format!("echo {cpu} > {file}");
+    let (_,err)=exec(&cmd);
+    if err.len()>0{
+        println!("err:{err}");
     }
 }
 fn set_irq_numa(mode:&str,gpu:usize,numa:i64,statc:bool){
@@ -248,13 +261,13 @@ fn set_irq_numa(mode:&str,gpu:usize,numa:i64,statc:bool){
         if mode.contains("set"){
             set_dyn_int(pci,cpu_idx,statc);
         }else{
-            let df=get_dyn_int(pci,statc);
+            let df=get_df_int(pci,statc);
             println!("{:?}",df);
         }
     }
 }
 
-fn get_options() -> (bool,bool,String,String,usize,usize) {
+fn get_options() -> (bool,bool,String,String,usize,usize,usize) {
     let matches = clap::Command::new("Interrupt Binding Tool")
         .version("v0.0.1 20240701")
         .author("Weixing Sun <weixing.sun@gmail.com>")
@@ -266,6 +279,7 @@ fn get_options() -> (bool,bool,String,String,usize,usize) {
         //.arg(clap::arg!(--numa <VALUE>).required(false).help("bind numa, default: 0"))
         .arg(clap::arg!(--cpu <VALUE>).required(false).help("bind cpu, default: 0"))
         .arg(clap::arg!(--gpu <VALUE>).required(false).help("gpu type, default: 200"))
+        .arg(clap::arg!(--index <VALUE>).required(false).help("irq index, default: -1 (all)"))
         .get_matches();
     let debug = *matches.get_one::<bool>("debug").unwrap();
     let statc = *matches.get_one::<bool>("static").unwrap();
@@ -278,19 +292,31 @@ fn get_options() -> (bool,bool,String,String,usize,usize) {
     let cpu = if cpu.is_none() {0} else {cpu.unwrap().parse().unwrap()};
     let gpu = matches.get_one::<String>("gpu");
     let gpu = if gpu.is_none() {200} else {gpu.unwrap().parse().unwrap()};
-    return (debug,statc,mode,name.to_owned(),cpu,gpu)
+    let index = matches.get_one::<String>("index");
+    let index = if index.is_none() {9999} else {index.unwrap().parse().unwrap()};
+    return (debug,statc,mode,name.to_owned(),cpu,gpu,index)
 }
 
 fn main() {
-    let (debug,statc,mode,name,cpu,gpu)=get_options();
+    let (debug,statc,mode,name,cpu,gpu,index)=get_options();
     unsafe { DEBUG=debug };
     std::env::set_var("POLARS_FMT_MAX_COLS", "28");
     disable_service();
     if mode.eq("get"){
-        let df=get_dyn_int(&name,statc);
-        println!("{:?}",df);
+        let df=get_df_int(&name,statc);
+        if index==9999{
+            println!("{:?}",df);
+        }else{
+            let df1=df.head(Some(index+1));
+            let df2=df1.tail(Some(1));
+            println!("{:?}",df2);
+        }
     }else if mode.eq("set"){
-        set_dyn_int(&name,cpu,statc);
+        if index==9999{
+            set_dyn_int(&name,cpu,statc);
+        }else{
+            set_dyn_int_one(&name,cpu,statc,index);
+        }
     }else if mode.ends_with("c"){  // set_8c
         let numa_n=count_numa_num();
         if numa_n>1{
